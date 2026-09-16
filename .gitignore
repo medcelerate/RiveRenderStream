@@ -1,0 +1,12 @@
+# Rive runtime is cloned + built by scripts/build_rive.bat, not vendored.
+/third_party/
+
+# CMake build output.
+/build/
+/dist/
+
+# Editor / OS cruft.
+.vs/
+.vscode/
+*.user
+.DS_Store

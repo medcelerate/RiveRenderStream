@@ -1,0 +1,146 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+# Pin the Rive runtime to a specific release tag so CI builds are reproducible.
+# Bump deliberately to a newer rive-app/rive-runtime tag
+# (https://github.com/rive-app/rive-runtime/releases) rather than tracking main.
+env:
+  RIVE_REF: runtime-v0.1.410
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Windows-only: RenderStream + D3D11 are Windows-only, so is this tool.
+  windows:
+    # Pin to windows-2022: windows-latest rolled to VS 2026 and dropped VS 2022,
+    # which breaks the hardcoded "Visual Studio 17 2022" CMake generator.
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install premake5
+        shell: pwsh
+        run: |
+          $version = "5.0.0-beta8"
+          $url = "https://github.com/premake/premake-core/releases/download/v$version/premake-$version-windows.zip"
+          $dest = "$env:RUNNER_TEMP\premake"
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          Invoke-WebRequest -Uri $url -OutFile "$dest\premake.zip"
+          Expand-Archive -Path "$dest\premake.zip" -DestinationPath $dest
+          "$dest" | Out-File -FilePath $env:GITHUB_PATH -Append
+          & "$dest\premake5.exe" --version
+
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Resolve Rive commit
+        id: rive
+        shell: bash
+        run: |
+          RIVE_REF="${RIVE_REF:-main}"
+          SHA=$(git ls-remote https://github.com/rive-app/rive-runtime.git "$RIVE_REF" | awk '{print $1}')
+          if [ -z "$SHA" ]; then echo "Could not resolve $RIVE_REF"; exit 1; fi
+          echo "ref=$RIVE_REF" >> "$GITHUB_OUTPUT"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Clone Rive runtime
+        shell: bash
+        run: |
+          mkdir -p third_party
+          git clone --recursive https://github.com/rive-app/rive-runtime.git third_party/rive-runtime
+          git -C third_party/rive-runtime checkout ${{ steps.rive.outputs.sha }}
+          git -C third_party/rive-runtime submodule update --init --recursive
+
+      - name: Restore Rive build cache
+        id: rive-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: third_party/rive-runtime/renderer/out
+          key: rive-windows-${{ steps.rive.outputs.sha }}-v1
+
+      - name: Build Rive runtime
+        if: steps.rive-cache.outputs.cache-hit != 'true'
+        env:
+          # --with_rive_canvas: GPU Canvas (RenderCanvas + Ore, D3D11/D3D12).
+          # --with_rive_scripting: real Luau VM (+ libhydrogen), needed for
+          # script-driven GPU Canvas content to actually animate.
+          # --no-lto: Rive's release LTO makes clang-cl emit bitcode-wrapped
+          # objs/libs that MSVC's link.exe can't consume (LNK1107); off => COFF.
+          RIVE_PREMAKE_ARGS: "--with_rive_text --with_rive_layout --with_rive_canvas --with_rive_scripting --no-lto"
+          # ninja builds the Rive libs fully parallel (Rive's MSBuild path is serial).
+          RIVE_BUILD_SYSTEM: "ninja"
+        # Args after `--` are forwarded to ninja as explicit targets, so we only
+        # build the static libs we link (skips the GLFW path_fiddle sample).
+        run: scripts\build_rive.bat release -- rive rive_pls_renderer rive_decoders rive_harfbuzz rive_sheenbidi rive_yoga libpng libjpeg libwebp zlib miniaudio luau_vm
+
+      - name: Configure
+        run: cmake -B build -G "Visual Studio 17 2022" -A x64
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Save Rive build cache
+        # Only after a successful link, so we never cache a half-built Rive out.
+        if: steps.rive-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: third_party/rive-runtime/renderer/out
+          key: rive-windows-${{ steps.rive.outputs.sha }}-v1
+
+      - name: Package
+        # Bake the pinned Rive tag into the zip name. The exe static-links Rive +
+        # the MSVC runtime and loads d3renderstream.dll from the Disguise install
+        # at runtime, so it ships as a bare exe with no bundled dependencies.
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $riveTag = $env:RIVE_REF -replace '^runtime-', ''
+          $zip = "dist\RiveRenderStream_win_rive-$riveTag.zip"
+          Compress-Archive -Path build\Release\RiveRenderStream.exe -DestinationPath $zip -Force
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: RiveRenderStream_win
+          path: dist/RiveRenderStream_win_rive-*.zip
+
+  # ---------------------------------------------------------------------------
+  release:
+    # Runs only on a v*.*.* tag. Attaches the built zip to a GitHub Release.
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: RiveRenderStream_win
+          path: release
+
+      - name: List release files
+        run: ls -la release
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/RiveRenderStream_win_rive-*.zip
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          body: |
+            Built against [rive-app/rive-runtime@${{ env.RIVE_REF }}](https://github.com/rive-app/rive-runtime/releases/tag/${{ env.RIVE_REF }}).
+          # Semver pre-release suffixes (v1.0.0-ea, v2.0.0-rc1, ...) publish as
+          # GitHub prereleases.
+          prerelease: ${{ contains(github.ref_name, '-') }}
