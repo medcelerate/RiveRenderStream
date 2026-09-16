@@ -71,6 +71,7 @@ jobs:
 
       - name: Build Rive runtime
         if: steps.rive-cache.outputs.cache-hit != 'true'
+        shell: pwsh
         env:
           # --with_rive_canvas: GPU Canvas (RenderCanvas + Ore, D3D11/D3D12).
           # --with_rive_scripting: real Luau VM (+ libhydrogen), needed for
@@ -82,7 +83,26 @@ jobs:
           RIVE_BUILD_SYSTEM: "ninja"
         # Args after `--` are forwarded to ninja as explicit targets, so we only
         # build the static libs we link (skips the GLFW path_fiddle sample).
-        run: scripts\build_rive.bat release -- rive rive_pls_renderer rive_decoders rive_harfbuzz rive_sheenbidi rive_yoga libpng libjpeg libwebp zlib miniaudio luau_vm
+        #
+        # Retry wrapper: Rive's premake dependency fetch (build/dependency.lua)
+        # is racy on a cold build - it clones each github dep only when the dir
+        # is missing, and two concurrent premake evaluations can both try to
+        # clone the same dep (e.g. rive-app/harfbuzz) into the same directory,
+        # the loser dying on "destination path already exists". It's timing
+        # dependent (passes more often than not), so retry on a cleaned
+        # dependencies/out tree up to 3 times.
+        run: |
+          $targets = "rive rive_pls_renderer rive_decoders rive_harfbuzz rive_sheenbidi rive_yoga libpng libjpeg libwebp zlib miniaudio luau_vm"
+          $ok = $false
+          for ($i = 1; $i -le 3; $i++) {
+            Write-Host "=== Rive build attempt $i ==="
+            cmd /c "scripts\build_rive.bat release -- $targets"
+            if ($LASTEXITCODE -eq 0) { $ok = $true; break }
+            Write-Host "Attempt $i failed (likely Rive dependency-fetch race); cleaning and retrying..."
+            Remove-Item -Recurse -Force third_party\rive-runtime\renderer\dependencies -ErrorAction SilentlyContinue
+            Remove-Item -Recurse -Force third_party\rive-runtime\renderer\out -ErrorAction SilentlyContinue
+          }
+          if (-not $ok) { Write-Error "Rive build failed after 3 attempts"; exit 1 }
 
       - name: Configure
         run: cmake -B build -G "Visual Studio 17 2022" -A x64
