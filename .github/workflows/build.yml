@@ -69,6 +69,37 @@ jobs:
           path: third_party/rive-runtime/renderer/out
           key: rive-windows-${{ steps.rive.outputs.sha }}-v1
 
+      - name: Pre-fetch Rive dependencies (avoid clone race)
+        if: steps.rive-cache.outputs.cache-hit != 'true'
+        shell: bash
+        # Rive's premake dependency fetch (build/dependency.lua) races on cold
+        # builds: it clones each github dep only when its dir is missing, so two
+        # concurrent premake evaluations both try to clone the same dep (e.g.
+        # rive-app/harfbuzz) into the same directory and the loser dies on
+        # "destination path already exists". Clone every literal
+        # dependency.github('proj','tag') serially up front, into the exact dir
+        # name dependency.lua expects (project with '/' -> '_', then '_<tag>'),
+        # so its os.isdir() check short-circuits and it never clones concurrently.
+        # Parsing the lua files keeps this version-agnostic across Rive bumps.
+        # Safe because none of the deps we build use dependency.lua's
+        # fresh-clone-only patch hook (only wamr does, and we don't build WASM).
+        run: |
+          set -u
+          DEPS="third_party/rive-runtime/renderer/dependencies"
+          mkdir -p "$DEPS"
+          grep -rhoE "dependency\.github\('[^']+',[[:space:]]*'[^']+'\)" third_party/rive-runtime --include="*.lua" \
+            | sed -E "s/.*\('([^']+)',[[:space:]]*'([^']+)'\).*/\1 \2/" | sort -u \
+            | while read -r proj tag; do
+                dir="${proj//\//_}_${tag}"
+                if [ ! -d "$DEPS/$dir" ]; then
+                  echo ">> pre-fetch $proj @ $tag"
+                  git -c advice.detachedHead=false -C "$DEPS" clone --depth 1 --branch "$tag" \
+                    "https://github.com/$proj.git" "$dir" \
+                    || echo "   (skip: $proj@$tag not clonable now; premake will fetch if actually needed)"
+                fi
+              done
+          echo "Pre-fetched into $DEPS:"; ls -1 "$DEPS" || true
+
       - name: Build Rive runtime
         if: steps.rive-cache.outputs.cache-hit != 'true'
         shell: pwsh
@@ -84,25 +115,21 @@ jobs:
         # Args after `--` are forwarded to ninja as explicit targets, so we only
         # build the static libs we link (skips the GLFW path_fiddle sample).
         #
-        # Retry wrapper: Rive's premake dependency fetch (build/dependency.lua)
-        # is racy on a cold build - it clones each github dep only when the dir
-        # is missing, and two concurrent premake evaluations can both try to
-        # clone the same dep (e.g. rive-app/harfbuzz) into the same directory,
-        # the loser dying on "destination path already exists". It's timing
-        # dependent (passes more often than not), so retry on a cleaned
-        # dependencies/out tree up to 3 times.
+        # The Pre-fetch step above already populated renderer/dependencies to
+        # dodge Rive's cold-build clone race, so attempt 1 should pass. Keep a
+        # small retry (wiping only out/, never the pre-fetched dependencies) as a
+        # safety net for genuine transient build blips.
         run: |
           $targets = "rive rive_pls_renderer rive_decoders rive_harfbuzz rive_sheenbidi rive_yoga libpng libjpeg libwebp zlib miniaudio luau_vm"
           $ok = $false
-          for ($i = 1; $i -le 3; $i++) {
+          for ($i = 1; $i -le 2; $i++) {
             Write-Host "=== Rive build attempt $i ==="
             cmd /c "scripts\build_rive.bat release -- $targets"
             if ($LASTEXITCODE -eq 0) { $ok = $true; break }
-            Write-Host "Attempt $i failed (likely Rive dependency-fetch race); cleaning and retrying..."
-            Remove-Item -Recurse -Force third_party\rive-runtime\renderer\dependencies -ErrorAction SilentlyContinue
+            Write-Host "Attempt $i failed; wiping out/ (keeping pre-fetched deps) and retrying..."
             Remove-Item -Recurse -Force third_party\rive-runtime\renderer\out -ErrorAction SilentlyContinue
           }
-          if (-not $ok) { Write-Error "Rive build failed after 3 attempts"; exit 1 }
+          if (-not $ok) { Write-Error "Rive build failed after 2 attempts"; exit 1 }
 
       - name: Configure
         run: cmake -B build -G "Visual Studio 17 2022" -A x64
