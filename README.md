@@ -73,6 +73,25 @@ Then, in a **RenderStream layer**, pick the `.riv` asset. Disguise launches
 no `-f` needed. Each artboard shows up as a selectable scene; view-model image
 properties appear as image inputs for bidirectional textures.
 
+## Sequenceable parameters (per scene)
+
+Each scene exposes these RenderStream parameters, controllable and sequenceable
+from Disguise (no command line needed):
+
+| Parameter | Type | Notes |
+|-----------|------|-------|
+| **Fit** | dropdown | Fill · Contain · Cover · Fit width · Fit height · None · Scale down · Layout |
+| **Alignment** | dropdown | Top/Center/Bottom × Left/Center/Right |
+| **&lt;image properties&gt;** | image | One per view-model image property on the artboard (bidirectional input). |
+
+The `--fit` / `--align` command-line values only set each dropdown's **default**;
+the live parameter drives them at runtime.
+
+> **Graphics adapter is not a parameter.** The D3D11 device (shared with
+> RenderStream) is created once at startup, before any parameter can be read, so
+> the adapter can't be switched live. Set it with the `--graphics-adapter` / `-g`
+> workload argument (or leave `-1` to use RenderStream's default adapter).
+
 ## Command-line arguments
 
 The asset `.riv` is the first positional argument (Disguise supplies it). Extra
@@ -86,9 +105,9 @@ RiveRenderStream.exe path\to\scene.riv [options]
 | Argument | Default | Meaning |
 |------|---------|---------|
 | *(positional)* / `--file`, `-f` | *(from Disguise)* | `.riv` asset to render. `--file` is an explicit override for manual runs. |
-| `--fit` | `1` (contain) | Rive fit: 0 fill · 1 contain · 2 cover · 3 fitWidth · 4 fitHeight · 5 none · 6 scaleDown · 7 layout. |
-| `--align` | `4` (center) | Rive alignment 0-8 (topLeft … bottomRight). |
-| `--graphics-adapter`, `-g` | `-1` | DXGI adapter ordinal (`-1` = first). |
+| `--fit` | `1` (contain) | *Default* for the Fit parameter: 0 fill · 1 contain · 2 cover · 3 fitWidth · 4 fitHeight · 5 none · 6 scaleDown · 7 layout. Overridden live by the Fit dropdown. |
+| `--align` | `4` (center) | *Default* for the Alignment parameter: 0-8 (topLeft … bottomRight). Overridden live by the Alignment dropdown. |
+| `--graphics-adapter`, `-g` | `-1` | DXGI adapter ordinal (`-1` = first). Startup-only (not a live parameter). |
 | `--timeout-limit` | `5000` | `awaitFrameData` timeout, ms. |
 | `--no-input` | *(off)* | Disable the image-input parameters (output only). |
 

@@ -16,6 +16,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cmath>
 #include <chrono>
 #include <iostream>
 #include <set>
@@ -83,11 +84,69 @@ bool parseArgs(int argc, char* argv[], Args& a, std::string& err)
     return true;
 }
 
-// Build a schema: one scene per artboard, and (when input is enabled) one
-// RS_PARAMETER_IMAGE per view-model image property, keyed by property name.
-// Strings are _strdup'd; ScopedSchema frees them. sceneImageKeys is filled in
-// artboard order for use at frame time.
+// Fit / Alignment option labels. Index order MUST match fitFromIndex /
+// alignmentFromIndex in RiveRSScene.hpp so the dropdown value maps correctly.
+static const std::vector<std::string> kFitOptions = {
+    "Fill", "Contain", "Cover", "Fit width", "Fit height",
+    "None", "Scale down", "Layout"
+};
+static const std::vector<std::string> kAlignOptions = {
+    "Top left", "Top center", "Top right",
+    "Center left", "Center", "Center right",
+    "Bottom left", "Bottom center", "Bottom right"
+};
+
+// A RS_PARAMETER_NUMBER field. When 'options' is non-empty it becomes a dropdown
+// (value = selected index), following the disguise RenderStream Schema sample's
+// addField(): options force min=0, max=n-1, step=1.
+RemoteParameter makeNumberField(const char* group, const char* key,
+                                const char* displayName, float def,
+                                float mn, float mx, float step,
+                                const std::vector<std::string>& options = {})
+{
+    RemoteParameter p{};
+    if (!options.empty()) { mn = 0.f; mx = (float)(options.size() - 1); step = 1.f; }
+    p.group       = _strdup(group);
+    p.displayName = _strdup(displayName);
+    p.key         = _strdup(key);
+    p.type        = RS_PARAMETER_NUMBER;
+    p.defaults.number.defaultValue = def;
+    p.defaults.number.min          = mn;
+    p.defaults.number.max          = mx;
+    p.defaults.number.step         = step;
+    p.nOptions = (uint32_t)options.size();
+    p.options  = p.nOptions
+        ? (const char**)malloc(p.nOptions * sizeof(const char*)) : nullptr;
+    for (size_t j = 0; j < options.size(); ++j)
+        p.options[j] = _strdup(options[j].c_str());
+    p.dmxOffset = -1;
+    p.dmxType   = RS_DMX_16_BE;
+    p.flags     = REMOTEPARAMETER_NO_FLAGS;
+    return p;
+}
+
+RemoteParameter makeImageField(const char* key)
+{
+    RemoteParameter p{};
+    p.group       = _strdup("Input");
+    p.displayName = _strdup(key);
+    p.key         = _strdup(key);
+    p.type        = RS_PARAMETER_IMAGE;
+    p.nOptions    = 0;
+    p.options     = nullptr;
+    p.dmxOffset   = -1;
+    p.dmxType     = RS_DMX_16_BE;
+    p.flags       = REMOTEPARAMETER_NO_FLAGS;
+    return p;
+}
+
+// Build a schema: one scene per artboard. Every scene exposes Fit and Alignment
+// as sequenceable dropdown parameters (keys "fit"/"align"); when input is
+// enabled it also exposes one RS_PARAMETER_IMAGE per view-model image property.
+// Strings/option arrays are _strdup'd/malloc'd; ScopedSchema frees them.
+// sceneImageKeys is filled in artboard order for reading images at frame time.
 void buildSchema(RiveRSScene& scene, ScopedSchema& scoped, bool enableInput,
+                 int fitDefault, int alignDefault,
                  std::vector<std::vector<std::string>>& sceneImageKeys)
 {
     scoped.schema.engineName    = _strdup("RiveRS");
@@ -110,29 +169,26 @@ void buildSchema(RiveRSScene& scene, ScopedSchema& scoped, bool enableInput,
                                        : name.c_str());
         rp.hash = 0;
 
+        std::vector<RemoteParameter> params;
+        params.push_back(makeNumberField("Layout", "fit", "Fit",
+                                         (float)fitDefault, 0, 7, 1, kFitOptions));
+        params.push_back(makeNumberField("Layout", "align", "Alignment",
+                                         (float)alignDefault, 0, 8, 1, kAlignOptions));
+
         std::vector<std::string> keys;
         if (enableInput) {
             keys = scene.imagePropertyNames(i);
             if (keys.empty()) keys.push_back("rive_input");
         }
         sceneImageKeys[i] = keys;
+        for (const auto& k : keys) params.push_back(makeImageField(k.c_str()));
 
-        rp.nParameters = (uint32_t)keys.size();
-        rp.parameters  = keys.empty() ? nullptr
-            : (RemoteParameter*)malloc(sizeof(RemoteParameter) * keys.size());
-        for (size_t k = 0; k < keys.size(); ++k) {
-            RemoteParameter p{};
-            p.group       = _strdup("Input");
-            p.displayName = _strdup(keys[k].c_str());
-            p.key         = _strdup(keys[k].c_str());
-            p.type        = RS_PARAMETER_IMAGE;
-            p.nOptions    = 0;
-            p.options     = nullptr;
-            p.dmxOffset   = -1;
-            p.dmxType     = RS_DMX_16_BE;
-            p.flags       = REMOTEPARAMETER_NO_FLAGS;
-            rp.parameters[k] = p;
-        }
+        rp.nParameters = (uint32_t)params.size();
+        rp.parameters  = (RemoteParameter*)malloc(
+            sizeof(RemoteParameter) * params.size());
+        for (size_t k = 0; k < params.size(); ++k)
+            rp.parameters[k] = params[k];
+
         scoped.schema.scenes.scenes[i] = rp;
     }
 }
@@ -174,7 +230,7 @@ int main(int argc, char* argv[])
     // Schema (scenes = artboards; image params = view-model image properties).
     ScopedSchema schema;
     std::vector<std::vector<std::string>> sceneImageKeys;
-    buildSchema(scene, schema, args.enableInput, sceneImageKeys);
+    buildSchema(scene, schema, args.enableInput, args.fit, args.align, sceneImageKeys);
     try {
         rs.setSchema(&schema.schema);
         // Key the schema to the asset (.riv) path, not the exe: for a custom-
@@ -230,32 +286,42 @@ int main(int argc, char* argv[])
             continue;
         }
 
-        // ---- Input: fill GPU canvases from Disguise, bind to view model ------
-        if (args.enableInput) {
+        // ---- Read this frame's parameters --------------------------------
+        // Fit/Align come from the sequenceable dropdown parameters (falling back
+        // to the CLI defaults); when input is enabled, fill GPU canvases from the
+        // image parameters and bind them to the view model. All parameters are
+        // fetched in one getFrameParameters call.
+        int fit = args.fit, align = args.align;
+        {
             const RemoteParameters& sc = schema.schema.scenes.scenes[frameData.scene];
             const auto& keys = sceneImageKeys[frameData.scene];
             try {
                 ParameterValues values = rs.getFrameParameters(sc);
-                for (size_t k = 0; k < keys.size(); ++k) {
-                    ImageFrameData image = values.get<ImageFrameData>(keys[k]);
-                    if (image.width == 0 || image.height == 0) continue;
+                fit   = (int)std::lround(values.get<float>("fit"));
+                align = (int)std::lround(values.get<float>("align"));
+                if (args.enableInput) {
+                    for (size_t k = 0; k < keys.size(); ++k) {
+                        ImageFrameData image = values.get<ImageFrameData>(keys[k]);
+                        if (image.width == 0 || image.height == 0) continue;
 
-                    CanvasInput& ci = canvasInputs[keys[k]];
-                    std::string cerr;
-                    if (!dev.ensureCanvasInput(ci, image.width, image.height,
-                                               image.format, cerr)) {
-                        std::cerr << "RiveRenderStream: " << cerr << std::endl;
-                        continue;
+                        CanvasInput& ci = canvasInputs[keys[k]];
+                        std::string cerr;
+                        if (!dev.ensureCanvasInput(ci, image.width, image.height,
+                                                   image.format, cerr)) {
+                            std::cerr << "RiveRenderStream: " << cerr << std::endl;
+                            continue;
+                        }
+                        SenderFrame recv{};
+                        recv.type = RS_FRAMETYPE_DX11_TEXTURE;
+                        recv.dx11.resource = ci.resource();
+                        rs.getFrameImage(image.imageId, recv);
+                        scene.bindImage((int)k, keys[k], ci.image());
                     }
-                    SenderFrame recv{};
-                    recv.type = RS_FRAMETYPE_DX11_TEXTURE;
-                    recv.dx11.resource = ci.resource();
-                    rs.getFrameImage(image.imageId, recv);
-                    scene.bindImage((int)k, keys[k], ci.image());
                 }
             } catch (const std::exception& e) {
-                // Missing/undelivered image for this frame - not fatal.
-                std::cerr << "RiveRenderStream: input skipped: "
+                // Missing/undelivered parameter for this frame - not fatal;
+                // keep the CLI-default fit/align and last-bound images.
+                std::cerr << "RiveRenderStream: parameters skipped: "
                           << e.what() << std::endl;
             }
         }
@@ -302,7 +368,7 @@ int main(int argc, char* argv[])
 
             uint32_t w = d.width, h = d.height;
             dev.renderInto(target, fd, [&](rive::Renderer* r) {
-                scene.draw(r, args.fit, args.align, w, h);
+                scene.draw(r, fit, align, w, h);
             });
 
             SenderFrame out{};
