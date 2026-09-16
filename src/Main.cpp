@@ -46,9 +46,15 @@ struct Args {
 
 bool parseArgs(int argc, char* argv[], Args& a, std::string& err)
 {
+    // RenderStream launches a custom-extension asset with "the asset's filename
+    // ... before any workload arguments" (RS2.0 README, Discovery and launching)
+    // - i.e. the .riv path arrives as the first positional argument, argv[1]. We
+    // capture the first non-flag token as the asset path. --file / -f stays as an
+    // explicit override for launching by hand outside Disguise.
     auto next = [&](int& i) -> const char* {
         return (i + 1 < argc) ? argv[++i] : nullptr;
     };
+    std::string positional;
     for (int i = 1; i < argc; ++i) {
         std::string s = argv[i];
         if (s == "--file" || s == "-f") {
@@ -60,11 +66,20 @@ bool parseArgs(int argc, char* argv[], Args& a, std::string& err)
         else if (s == "--graphics-adapter" || s == "-g") { const char* v = next(i); if (v) a.adapter = std::atoi(v); }
         else if (s == "--timeout-limit")    { const char* v = next(i); if (v) a.timeout = std::atoi(v); }
         else if (s == "--no-input")         { a.enableInput = false; }
-        else {
-            // Unknown flags are ignored so Disguise-appended args don't abort us.
+        else if (!s.empty() && s[0] == '-') {
+            // Unknown flag: ignore so Disguise-appended args don't abort us.
+        }
+        else if (positional.empty()) {
+            positional = s;  // first bare token = the asset (.riv) path
         }
     }
-    if (a.file.empty()) { err = "--file <path-to-.riv> is required"; return false; }
+    // Explicit --file wins; otherwise fall back to the positional asset path.
+    if (a.file.empty()) a.file = positional;
+    if (a.file.empty()) {
+        err = "no .riv asset given (RenderStream passes it as the first argument; "
+              "for manual runs use --file <path-to-.riv>)";
+        return false;
+    }
     return true;
 }
 
@@ -162,7 +177,10 @@ int main(int argc, char* argv[])
     buildSchema(scene, schema, args.enableInput, sceneImageKeys);
     try {
         rs.setSchema(&schema.schema);
-        rs.saveSchema(argv[0], &schema.schema);
+        // Key the schema to the asset (.riv) path, not the exe: for a custom-
+        // extension asset d3service looks for an 'rs_<asset>.json' cache next to
+        // the asset file, so saveSchema must be given the asset path.
+        rs.saveSchema(args.file.c_str(), &schema.schema);
     } catch (const std::exception& e) {
         std::cerr << "RiveRenderStream: failed to set schema: "
                   << e.what() << std::endl;

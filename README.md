@@ -48,18 +48,44 @@ The build defines `RIVE_CANVAS` / `RIVE_ORE` so the `makeRenderCanvas` API is
 visible and its object layout matches the `--with_rive_canvas` runtime libs.
 Prebuilt binaries are attached to each [GitHub Release](../../releases).
 
-## Usage
+## Setup in Disguise (`.riv` as a RenderStream asset)
 
-Registered as a RenderStream asset, Disguise appends its own arguments; the
-relevant ones you set are:
+RiveRenderStream registers as the handler for `.riv` files, so you select a `.riv`
+directly in Disguise rather than passing it on a command line. One-time setup on
+each render (rx) machine:
+
+1. **Enable the extension.** In your *RenderStream Projects* folder (path from
+   `HKEY_CURRENT_USER\Software\d3 Technologies\d3 Production Suite\RenderStream
+   Projects Folder`), create/append `permitted_custom_extensions.txt` with one
+   line:
+   ```
+   riv
+   ```
+2. **Associate `.riv` with the exe.** Set Windows' default app for `.riv` to
+   `RiveRenderStream.exe` (Open with → Choose another app → Always). `d3service`
+   launches custom-extension assets with their registered default application.
+3. **Drop your `.riv`** files into the RenderStream Projects folder. `d3service`
+   detects each as a RenderStream Asset (and picks up an `rs_<name>.json` schema
+   cache next to it, which the exe writes on first launch).
+
+Then, in a **RenderStream layer**, pick the `.riv` asset. Disguise launches
+`RiveRenderStream.exe` with the asset path as the first argument automatically -
+no `-f` needed. Each artboard shows up as a selectable scene; view-model image
+properties appear as image inputs for bidirectional textures.
+
+## Command-line arguments
+
+The asset `.riv` is the first positional argument (Disguise supplies it). Extra
+options can be set in the RenderStream layer's *workload arguments*; for manual
+runs outside Disguise, pass them yourself:
 
 ```
-RiveRenderStream.exe --file path\to\scene.riv [options]
+RiveRenderStream.exe path\to\scene.riv [options]
 ```
 
-| Flag | Default | Meaning |
+| Argument | Default | Meaning |
 |------|---------|---------|
-| `--file`, `-f` | *(required)* | `.riv` file to render. |
+| *(positional)* / `--file`, `-f` | *(from Disguise)* | `.riv` asset to render. `--file` is an explicit override for manual runs. |
 | `--fit` | `1` (contain) | Rive fit: 0 fill · 1 contain · 2 cover · 3 fitWidth · 4 fitHeight · 5 none · 6 scaleDown · 7 layout. |
 | `--align` | `4` (center) | Rive alignment 0-8 (topLeft … bottomRight). |
 | `--graphics-adapter`, `-g` | `-1` | DXGI adapter ordinal (`-1` = first). |
